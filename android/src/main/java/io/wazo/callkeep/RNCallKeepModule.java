@@ -27,8 +27,6 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
-import android.content.res.Resources;
-import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Icon;
 import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
@@ -38,12 +36,11 @@ import android.os.Bundle;
 import android.view.WindowManager;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.core.app.ActivityCompat;
+import androidx.annotation.RequiresApi;
 import androidx.core.content.ContextCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 import android.telecom.CallAudioState;
 import android.telecom.Connection;
-import android.telecom.DisconnectCause;
 import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
@@ -51,7 +48,6 @@ import android.telephony.TelephonyManager;
 import android.util.Log;
 
 import com.facebook.react.bridge.Arguments;
-import com.facebook.react.bridge.Dynamic;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
@@ -66,18 +62,15 @@ import com.facebook.react.HeadlessJsTaskService;
 import com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter;
 import com.facebook.react.modules.permissions.PermissionsModule;
 
-import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.ResourceBundle;
+import java.util.concurrent.Executors;
 
 import org.json.JSONObject;
 import org.json.JSONException;
-
-import static androidx.core.app.ActivityCompat.requestPermissions;
 
 import static io.wazo.callkeep.Constants.EXTRA_CALLER_NAME;
 import static io.wazo.callkeep.Constants.EXTRA_CALL_UUID;
@@ -147,12 +140,15 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         return _settings;
     }
 
+    @RequiresApi(api = Build.VERSION_CODES.S)
     private RNCallKeepModule(ReactApplicationContext reactContext) {
         super(reactContext);
         Log.d(TAG, "[RNCallKeepModule] constructor");
 
         this.reactContext = reactContext;
         delayedEvents = new WritableNativeArray();
+        registerCommunicationDeviceChangedListener();
+        registerPermissionResultListener();
     }
 
     private boolean isSelfManaged() {
@@ -347,6 +343,7 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
         conn.onAnswer();
     }
+
 
     @ReactMethod
     public void startCall(String uuid, String number, String callerName) {
@@ -650,100 +647,147 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         }
     }
 
+
+
+    @RequiresApi(api = Build.VERSION_CODES.S)
+    public void registerCommunicationDeviceChangedListener(){
+        AudioManager audioManager = (AudioManager) getAppContext().getSystemService(getAppContext().AUDIO_SERVICE);
+
+        AudioManager.OnCommunicationDeviceChangedListener listener =
+                new AudioManager.OnCommunicationDeviceChangedListener() {
+                    @Override
+                    public void onCommunicationDeviceChanged(AudioDeviceInfo device) {
+                        // Handle changes
+                        Log.d(TAG, String.format("onCommunicationDeviceChanged: %d", device.getType()));
+                        notifyAudioRouteChanged(device);
+                    }
+                };
+
+        audioManager.addOnCommunicationDeviceChangedListener(Executors.newSingleThreadExecutor(), listener);
+    }
+
+
+    public void registerPermissionResultListener(){
+        IntentFilter filter = new IntentFilter("com.mobile.broadcast.onRequestPermissionsResult");
+
+        reactContext.registerReceiver(new BroadcastReceiver(){
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                RNCallKeepModule.onRequestPermissionsResult(
+                        intent.getIntExtra("requestCode",-1),
+                        intent.getStringArrayExtra("permissions"),
+                        intent.getIntArrayExtra("grantResults"));
+            }
+        },filter);
+    }
+
+
+    @RequiresApi(api = Build.VERSION_CODES.S)
+    @ReactMethod
+    public void clearAudioDevice(){
+        AudioManager audioManager = (AudioManager) getAppContext().getSystemService(getAppContext().AUDIO_SERVICE);
+        audioManager.clearCommunicationDevice();
+    }
+
+    /**
+     * Notifies JS land that the devices list has changed.
+     */
+    @RequiresApi(api = Build.VERSION_CODES.S)
+    private void notifyAudioRouteChanged() {
+        AudioManager audioManager = (AudioManager) getAppContext().getSystemService(getAppContext().AUDIO_SERVICE);
+
+        AudioDeviceInfo device = audioManager.getCommunicationDevice();
+
+        notifyAudioRouteChanged(device);
+    }
+
+
+    /**
+     * Notifies JS land that the devices list has changed.
+     */
+    @RequiresApi(api = Build.VERSION_CODES.S)
+    private void notifyAudioRouteChanged(AudioDeviceInfo device) {
+
+        if(device == null) return;
+
+        WritableMap info = Arguments.createMap();
+        final String name =getAudioRouteType(device.getType());
+        info.putString("type", name);
+        info.putString("name", name);
+        info.putBoolean("selected", true);
+
+        Log.d(TAG, String.format("notifyAudioRouteChanged: %d", device.getId()));
+
+        sendEventToJS("RNCallKeepDidChangeAudioRoute", info);
+    }
+
+
+    @RequiresApi(api = Build.VERSION_CODES.S)
     @ReactMethod
     public void setAudioRoute(String uuid, String audioRoute, Promise promise){
-        try {
-            VoiceConnection conn = (VoiceConnection) VoiceConnectionService.getConnection(uuid);
-            if (conn == null) {
-                return;
+        Context context = this.getContext();
+        AudioManager audioManager = (AudioManager) context.getSystemService(context.AUDIO_SERVICE);
+        List<AudioDeviceInfo> audioDevices = audioManager.getAvailableCommunicationDevices();
+        AudioDeviceInfo deviceInfo = null;
+
+        for (AudioDeviceInfo audioDevice : audioDevices) {
+            if (getAudioRouteType(audioDevice.getType()).equals(audioRoute)) {
+                deviceInfo = audioDevice;
             }
-            if(audioRoute.equals("Bluetooth")) {
-                Log.d(TAG,"[RNCallKeepModule] setting audio route: Bluetooth");
-                conn.setAudioRoute(CallAudioState.ROUTE_BLUETOOTH);
-                promise.resolve(true);
-                return;
-            }
-            if(audioRoute.equals("Headset")) {
-                Log.d(TAG,"[RNCallKeepModule] setting audio route: Headset");
-                conn.setAudioRoute(CallAudioState.ROUTE_WIRED_HEADSET);
-                promise.resolve(true);
-                return;
-            }
-            if(audioRoute.equals("Speaker")) {
-                Log.d(TAG,"[RNCallKeepModule] setting audio route: Speaker");
-                conn.setAudioRoute(CallAudioState.ROUTE_SPEAKER);
-                promise.resolve(true);
-                return;
-            }
-            Log.d(TAG,"[RNCallKeepModule] setting audio route: Wired/Earpiece");
-            conn.setAudioRoute(CallAudioState.ROUTE_WIRED_OR_EARPIECE);
+        }
+
+        if (deviceInfo != null) {
+            Log.d(TAG, String.format("setAudioRoute: %s, type: %s, routeSpeaker: %s", audioRoute, getAudioRouteType(deviceInfo.getType()), deviceInfo.getProductName()));
+            audioManager.setCommunicationDevice(deviceInfo);
             promise.resolve(true);
-        } catch (Exception e) {
-            promise.reject("SetAudioRoute", e.getMessage());
+        }else {
+            promise.resolve(false);
         }
     }
 
+    @RequiresApi(api = Build.VERSION_CODES.S)
     @ReactMethod
     public void getAudioRoutes(Promise promise){
         try {
-            Context context = this.getAppContext();
-            if (context == null) {
-                Log.w(TAG, "[RNCallKeepModule][getAudioRoutes] no react context found.");
-                promise.reject("No react context found to list audio routes");
-                return;
-            }
-            AudioManager audioManager = (AudioManager) context.getSystemService(context.AUDIO_SERVICE);
             WritableArray devices = Arguments.createArray();
-            ArrayList<String> typeChecker = new ArrayList<>();
-            AudioDeviceInfo[] audioDeviceInfo = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS + AudioManager.GET_DEVICES_OUTPUTS);
-            String selectedAudioRoute = getSelectedAudioRoute(audioManager);
-            for (AudioDeviceInfo device : audioDeviceInfo){
-                String type = getAudioRouteType(device.getType());
-                if(type != null && !typeChecker.contains(type)) {
-                    WritableMap deviceInfo = Arguments.createMap();
-                    deviceInfo.putString("name",  type);
-                    deviceInfo.putString("type",  type);
-                    if(type.equals(selectedAudioRoute)) {
-                        deviceInfo.putBoolean("selected",  true);
-                    }
-                    typeChecker.add(type);
-                    devices.pushMap(deviceInfo);
-                }
+            AudioManager audioManager = (AudioManager) reactContext.getSystemService(reactContext.AUDIO_SERVICE);
+            List<AudioDeviceInfo> audioDevices = audioManager.getAvailableCommunicationDevices();
+            AudioDeviceInfo current = audioManager.getCommunicationDevice();
+
+            for (AudioDeviceInfo device : audioDevices) {
+                WritableMap info = Arguments.createMap();
+                final String name = getAudioRouteType(device.getType());
+                info.putInt("deviceId", device.getId());
+                info.putString("type", name);
+                info.putString("name", name);
+                info.putBoolean("selected", current != null && current.getId() == device.getId());
+                devices.pushMap(info);
             }
             promise.resolve(devices);
-        } catch(Exception e) {
-            promise.reject("GetAudioRoutes Error", e.getMessage());
+        } catch (Exception e) {
+            promise.reject(e);
         }
     }
 
     private String getAudioRouteType(int type){
         switch (type){
             case(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP):
+                return "BLUETOOTH_A2DP";
             case(AudioDeviceInfo.TYPE_BLUETOOTH_SCO):
                 return "Bluetooth";
             case(AudioDeviceInfo.TYPE_WIRED_HEADPHONES):
+                return "Headphone";
             case(AudioDeviceInfo.TYPE_WIRED_HEADSET):
                 return "Headset";
             case(AudioDeviceInfo.TYPE_BUILTIN_MIC):
                 return "Phone";
             case(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER):
                 return "Speaker";
+            case(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE):
+                return "Earpiece";
             default:
                 return null;
         }
-    }
-
-    private String getSelectedAudioRoute(AudioManager audioManager){
-        if(audioManager.isBluetoothScoOn()){
-            return "Bluetooth";
-        }
-        if(audioManager.isSpeakerphoneOn()){
-            return "Speaker";
-        }
-        if(audioManager.isWiredHeadsetOn()){
-            return "Headset";
-        }
-        return "Phone";
     }
 
     @ReactMethod
@@ -924,12 +968,14 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         List<String> permsList = Arrays.asList(permissions);
         for (int result : grantResults) {
             if (permsList.contains(grantedPermissions[permissionsIndex]) && result != PackageManager.PERMISSION_GRANTED) {
-                hasPhoneAccountPromise.resolve(false);
+                if(hasPhoneAccountPromise != null)
+                    hasPhoneAccountPromise.resolve(false);
                 return;
             }
             permissionsIndex++;
         }
-        hasPhoneAccountPromise.resolve(true);
+        if(hasPhoneAccountPromise != null)
+            hasPhoneAccountPromise.resolve(true);
     }
 
     public Activity getCurrentReactActivity() {
@@ -972,7 +1018,7 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
     }
 
     public void sendEventToJS(String eventName, @Nullable WritableMap params) {
-        boolean isBoundToJS = this.reactContext.hasActiveCatalystInstance();
+        boolean isBoundToJS = this.reactContext.hasActiveReactInstance();
         Log.v(TAG, "[RNCallKeepModule] sendEventToJS, eventName: " + eventName + ", bound: " + isBoundToJS + ", hasListeners: " + hasListeners + " args : " + (params != null ? params.toString() : "null"));
 
         if (isBoundToJS && hasListeners) {
@@ -1197,4 +1243,6 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
             }
         }
     }
+
+
 }
